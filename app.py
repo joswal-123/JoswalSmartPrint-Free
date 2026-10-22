@@ -3,7 +3,7 @@ import json
 import uuid
 import secrets
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from flask import (
     Flask,
@@ -23,10 +23,16 @@ JOBS_FILE = BASE_DIR / "jobs.json"
 UPLOAD_DIR.mkdir(exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+ALLOWED_PRINT_TYPES = {"bw", "color", "id", "photo"}
 
-# Render Environment में अलग और मजबूत PIN तथा Agent Token सेट करें।
+# Render Environment variables
 UPLOAD_PIN = os.getenv("PRINT_UPLOAD_PIN", "")
 AGENT_TOKEN = os.getenv("PRINT_AGENT_TOKEN", "")
+
+# Processing jobs older than this may be retried.
+# This is a recovery measure, not a guarantee against duplicate prints.
+PROCESSING_TIMEOUT_MINUTES = 30
+
 
 PAGE = """
 <!doctype html>
@@ -34,7 +40,7 @@ PAGE = """
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Joswal Smart Print</title>
+<title>Joswal Smart Print Free</title>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -92,8 +98,8 @@ button:disabled { opacity: .6; }
   <p id="message"></p>
   <p class="note">
     भुगतान इस वेबसाइट पर नहीं है। PIN सेट होने तक अपलोड बंद रहेगा।
-    ID Card और Passport Photo के विशेष लेआउट अभी लागू नहीं हैं।
-    Render Free पर रीस्टार्ट होने से अपलोड की फाइलें खो सकती हैं।
+    ID Card और Passport Photo का विशेष लेआउट अभी उपलब्ध नहीं है।
+    Render Free की फाइलें रीस्टार्ट होने पर खो सकती हैं।
   </p>
 </div>
 
@@ -132,6 +138,24 @@ form.addEventListener("submit", async (event) => {
 """
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def iso_now():
+    return utc_now().isoformat()
+
+
+def parse_datetime(value):
+    try:
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def read_jobs():
     try:
         data = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
@@ -157,6 +181,28 @@ def agent_authorized():
     )
 
 
+def find_job(jobs, order_id):
+    return next(
+        (item for item in jobs if item.get("order_id") == order_id),
+        None,
+    )
+
+
+def recover_stale_jobs(jobs):
+    now = utc_now()
+    cutoff = now - timedelta(minutes=PROCESSING_TIMEOUT_MINUTES)
+
+    for job in jobs:
+        if job.get("status") != "processing":
+            continue
+
+        started = parse_datetime(job.get("processing_started_at"))
+        if started and started < cutoff:
+            job["status"] = "queued"
+            job.pop("processing_started_at", None)
+            job["recovered_at"] = now.isoformat()
+
+
 @app.get("/")
 def home():
     return render_template_string(PAGE)
@@ -169,7 +215,6 @@ def health():
 
 @app.post("/api/upload")
 def upload_file():
-    # PIN सेट नहीं है तो कोई अपलोड स्वीकार नहीं होगा।
     if not UPLOAD_PIN:
         return jsonify(
             error="Admin setup बाकी है। Render में PRINT_UPLOAD_PIN सेट करें।"
@@ -198,13 +243,22 @@ def upload_file():
         return jsonify(error="कॉपी 1 से 500 के बीच रखें।"), 400
 
     print_type = request.form.get("print_type", "color").lower()
-    if print_type not in {"bw", "color", "id", "photo"}:
+    if print_type not in ALLOWED_PRINT_TYPES:
         return jsonify(error="प्रिंट प्रकार गलत है।"), 400
+
+    if print_type in {"id", "photo"}:
+        return jsonify(
+            error=(
+                "ID Card और Passport Photo का विशेष लेआउट अभी तैयार नहीं है। "
+                "फिलहाल PDF या सामान्य फोटो के लिए B&W/Colour चुनें।"
+            )
+        ), 400
 
     order_id = uuid.uuid4().hex
     filename = order_id + extension
+    destination = UPLOAD_DIR / filename
 
-    uploaded.save(UPLOAD_DIR / filename)
+    uploaded.save(destination)
 
     job = {
         "order_id": order_id,
@@ -212,15 +266,20 @@ def upload_file():
         "original_name": Path(uploaded.filename).name[:180],
         "file_ext": extension,
         "copies": copies,
-        "mode": "bw" if print_type == "bw" else "color",
+        "mode": print_type,
         "job_type": print_type,
         "status": "queued",
-        "created_at": datetime.now(timezone.utc).isoformat(),
+        "created_at": iso_now(),
     }
 
-    jobs = read_jobs()
-    jobs.append(job)
-    write_jobs(jobs)
+    try:
+        jobs = read_jobs()
+        jobs.append(job)
+        write_jobs(jobs)
+    except OSError:
+        destination.unlink(missing_ok=True)
+        app.logger.exception("Could not save print job")
+        return jsonify(error="जॉब सेव नहीं हुई। कृपया दोबारा कोशिश करें।"), 500
 
     return jsonify(
         message="फाइल कतार में भेज दी गई। Job ID: " + order_id,
@@ -234,20 +293,24 @@ def get_print_jobs():
         return jsonify(error="Unauthorized agent"), 401
 
     jobs = read_jobs()
-    queued = [
-        dict(job) for job in jobs
-        if job.get("status") == "queued"
-    ]
+    recover_stale_jobs(jobs)
 
-    queued_ids = {job["order_id"] for job in queued}
-    for job in jobs:
-        if job.get("order_id") in queued_ids:
-            job["status"] = "processing"
+    # Return only one job per request to avoid claiming a whole batch.
+    queued_job = next(
+        (job for job in jobs if job.get("status") == "queued"),
+        None,
+    )
 
-    if queued_ids:
+    if queued_job:
+        queued_job["status"] = "processing"
+        queued_job["processing_started_at"] = iso_now()
+        queued_job["attempts"] = int(queued_job.get("attempts", 0)) + 1
         write_jobs(jobs)
 
-    return jsonify(jobs=queued)
+        return jsonify(jobs=[dict(queued_job)])
+
+    write_jobs(jobs)
+    return jsonify(jobs=[])
 
 
 @app.get("/api/print-jobs/<order_id>/file")
@@ -255,18 +318,22 @@ def download_print_job(order_id):
     if not agent_authorized():
         return jsonify(error="Unauthorized agent"), 401
 
-    job = next(
-        (item for item in read_jobs()
-         if item.get("order_id") == order_id),
-        None,
-    )
+    jobs = read_jobs()
+    job = find_job(jobs, order_id)
 
-    if not job or job.get("status") not in {"queued", "processing"}:
-        return jsonify(error="Job not found"), 404
+    if not job or job.get("status") != "processing":
+        return jsonify(error="Job not found or not processing"), 404
+
+    filename = job.get("filename", "")
+    if Path(filename).name != filename:
+        return jsonify(error="Invalid filename"), 400
+
+    if not (UPLOAD_DIR / filename).is_file():
+        return jsonify(error="Uploaded file is no longer available"), 404
 
     return send_from_directory(
         UPLOAD_DIR,
-        job["filename"],
+        filename,
         as_attachment=True,
     )
 
@@ -283,23 +350,23 @@ def complete_print_job(order_id):
         return jsonify(error="Invalid status"), 400
 
     jobs = read_jobs()
-    job = next(
-        (item for item in jobs
-         if item.get("order_id") == order_id),
-        None,
-    )
+    job = find_job(jobs, order_id)
 
     if not job:
         return jsonify(error="Job not found"), 404
 
+    if job.get("status") != "processing":
+        return jsonify(error="Job is not processing"), 409
+
     job["status"] = status
-    job["completed_at"] = datetime.now(timezone.utc).isoformat()
+    job["completed_at"] = iso_now()
+    job.pop("processing_started_at", None)
 
     if status == "error":
         job["error"] = str(data.get("message", "Print failed"))[:500]
 
     write_jobs(jobs)
-    return jsonify(ok=True)
+    return jsonify(ok=True, order_id=order_id, status=status)
 
 
 @app.errorhandler(413)
