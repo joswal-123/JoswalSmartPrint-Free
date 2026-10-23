@@ -231,7 +231,10 @@ def upload_file():
     if not UPLOAD_PIN:
         return jsonify(error="Render में PRINT_UPLOAD_PIN सेट करें।"), 503
 
-    if not secrets.compare_digest(request.form.get("pin", ""), UPLOAD_PIN):
+    if not secrets.compare_digest(
+    request.form.get("pin", "").encode("utf-8"),
+    UPLOAD_PIN.encode("utf-8")
+):
         return jsonify(error="PIN गलत है।"), 403
 
     uploaded = request.files.get("file")
@@ -386,3 +389,4 @@ def file_too_large(_error):
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+)
